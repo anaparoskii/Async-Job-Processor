@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<SystemConfig>
+	<WorkerCount>5</WorkerCount>
+	<MaxQueueSize>100</MaxQueueSize>
+	<Jobs>
+		<Job Type="Prime" Payload="numbers:10_000,threads:3" Priority="1"/>
+		<Job Type="Prime" Payload="numbers:20_000,threads:2" Priority="2"/>
+		<Job Type="IO" Payload="delay:1_000" Priority="3"/>
+		<Job Type="IO" Payload="delay:3_000" Priority="3"/>
+		<Job Type="IO" Payload="delay:15_000" Priority="3"/>
+	</Jobs>
+</SystemConfig>
