@@ -53,7 +53,7 @@ namespace ProcessingSystem.Services
                 {
                     while (true)
                     {
-                        _signal.Wait();
+                        await _signal.WaitAsync();
                         Job? job = null;
                         lock (_jobQueue)
                         {
@@ -62,14 +62,30 @@ namespace ProcessingSystem.Services
                         }
                         if (job != null)
                         {
-                            int result = await ProcessJobWithRetry(job);
-                            if (result != -1)
+                            try
                             {
+                                int result = await ProcessJobWithRetry(job);
+                                if (result != -1)
+                                {
+                                    lock (_registryLock)
+                                    {
+                                        if (_jobRegistry.TryGetValue(job.Id, out var tcs))
+                                        {
+                                            tcs.SetResult(result);
+                                            _jobRegistry.Remove(job.Id);
+                                        }
+                                    }
+                                }
+                            }
+                            catch (Exception ex) 
+                            {
+                                await LogAsync($"[{DateTime.Now}] [ERROR] Job {job.Id} crashed: {ex.Message}");
+
                                 lock (_registryLock)
                                 {
                                     if (_jobRegistry.TryGetValue(job.Id, out var tcs))
                                     {
-                                        tcs.SetResult(result);
+                                        tcs.SetException(ex);
                                         _jobRegistry.Remove(job.Id);
                                     }
                                 }
@@ -91,6 +107,12 @@ namespace ProcessingSystem.Services
         public JobHandle Submit(Job job)
         {
             if (job == null) throw new ArgumentNullException(nameof(job));
+
+            if (job.Id == Guid.Empty)
+            {
+                job.Id = Guid.NewGuid();
+            }
+
             var tcs = new TaskCompletionSource<int>();
             lock (_jobQueue)
             {
@@ -235,8 +257,11 @@ namespace ProcessingSystem.Services
         private bool IsPrime(int n)
         {
             if (n < 2) return false;
-            for (int i = 2; i <= Math.Sqrt(n); i++)
+            int limit = (int)Math.Sqrt(n); 
+            for (int i = 2; i <= limit; i++)
+            {
                 if (n % i == 0) return false;
+            }
             return true;
         }
 
@@ -283,6 +308,9 @@ namespace ProcessingSystem.Services
             {
                 completed = _completedRecords.ToList();
                 failed = _failedRecords.ToList();
+
+                _completedRecords.Clear();
+                _failedRecords.Clear();
             }
 
             var completedByType = completed

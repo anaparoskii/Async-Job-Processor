@@ -25,9 +25,6 @@ namespace ProcessingSystem.Helper
             var config = serializer.Deserialize(reader) as SystemConfig ?? 
                 throw new InvalidOperationException("Failed to deserialize config file.");
 
-            foreach (var job in config.Jobs)
-                job.Id = Guid.NewGuid();
-
             return config;
         }
     }
