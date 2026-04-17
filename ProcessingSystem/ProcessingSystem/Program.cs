@@ -12,215 +12,128 @@ namespace ProcessingSystem.ConsoleApp
 
         static async Task Main(string[] args)
         {
-            Console.WriteLine("Industrial Processing System - Starting...");
-            Console.WriteLine("========================================");
+            Console.WriteLine("Processing System - Starting...");
+
+            string configPath = "SystemConfig.xml";
+            SystemConfig config;
 
             try
             {
-                string configPath = "config.xml";
-                SystemConfig config;
-
-                try
+                config = ConfigLoader.LoadConfig(configPath);
+                Console.WriteLine($"Config loaded: {config.WorkerCount} workers, queue size {config.MaxQueueSize}, {config.Jobs?.Count ?? 0} initial jobs");
+                for (int i = 0; i < config.Jobs?.Count; i++)
                 {
-                    config = ConfigLoader.LoadConfig(configPath);
-                    Console.WriteLine($"Configuration loaded from: {configPath}");
+                    Console.WriteLine(config.Jobs[i].Id + " " + config.Jobs[i].Type);
                 }
-                catch (FileNotFoundException)
-                {
-                    Console.WriteLine($"Config file {configPath} not found. Creating default config...");
-                    return;
-                }
-
-                Console.WriteLine($"Worker Count: {config.WorkerCount}");
-                Console.WriteLine($"Max Queue Size: {config.MaxQueueSize}");
-                Console.WriteLine($"Initial Jobs: {config.Jobs?.Count ?? 0}");
-                Console.WriteLine("========================================");
-
-                var processingSystem = new ProcessingSystem.Services.ProcessingSystem(config);
-
-                int producerThreads = config.WorkerCount;
-                var producerTasks = new List<Task>();
-                var cts = new CancellationTokenSource();
-
-                Console.WriteLine($"\nStarting {producerThreads} producer threads...");
-                Console.WriteLine("Press 'q' to quit, 's' for status, 't' for top jobs\n");
-
-                for (int i = 0; i < producerThreads; i++)
-                {
-                    int producerId = i;
-                    producerTasks.Add(Task.Run(async () =>
-                    {
-                        await ProduceJobsAsync(processingSystem, producerId, cts.Token);
-                    }));
-                }
-
-                bool running = true;
-                while (running)
-                {
-                    if (Console.KeyAvailable)
-                    {
-                        var key = Console.ReadKey(true).Key;
-                        switch (key)
-                        {
-                            case ConsoleKey.Q:
-                                running = false;
-                                break;
-                            case ConsoleKey.S:
-                                ShowStatus(processingSystem);
-                                break;
-                            case ConsoleKey.T:
-                                ShowTopJobs(processingSystem);
-                                break;
-                            case ConsoleKey.G:
-                                await ShowJobDetails(processingSystem);
-                                break;
-                        }
-                    }
-                    await Task.Delay(100);
-                }
-
-                Console.WriteLine("\n\nInitiating graceful shutdown...");
-                Console.WriteLine("Stopping producers...");
-                cts.Cancel();
-
-                try
-                {
-                    await Task.WhenAll(producerTasks);
-                }
-                catch (OperationCanceledException)
-                {
-                    // Očekivani izuzetak
-                }
-
-                Console.WriteLine("Waiting for remaining jobs to complete...");
-                await Task.Delay(3000);
-
-                Console.WriteLine("Shutting down processing system...");
-                await processingSystem.ShutdownAsync();
-
-                Console.WriteLine("\n=== Final Statistics ===");
-                Console.WriteLine($"Total jobs submitted: {_submittedJobs}");
-                Console.WriteLine($"Total jobs rejected: {_rejectedJobs}");
-                Console.WriteLine("========================");
-                Console.WriteLine("\nSystem shutdown complete. Press any key to exit.");
-                Console.ReadKey();
             }
-            catch (Exception ex)
+            catch (FileNotFoundException)
             {
-                Console.WriteLine($"Fatal error: {ex.Message}");
-                Console.WriteLine($"Stack trace: {ex.StackTrace}");
-                Console.WriteLine("\nPress any key to exit...");
-                Console.ReadKey();
+                Console.WriteLine($"Config file not found at '{configPath}'. Exiting.");
+                return;
             }
+
+            var system = new ProcessingSystem.Services.ProcessingSystem(config);
+            var cts = new CancellationTokenSource();
+
+            var producerTasks = Enumerable.Range(0, config.WorkerCount)
+                .Select(id => Task.Run(() => ProduceJobsAsync(system, id, cts.Token)))
+                .ToList();
+
+            Console.WriteLine($"\n{config.WorkerCount} producers running. Press Q to quit, S for status, T for top jobs, G for job details.\n");
+
+            while (true)
+            {
+                if (!Console.KeyAvailable)
+                {
+                    await Task.Delay(100);
+                    continue;
+                }
+
+                var key = Console.ReadKey(true).Key;
+                if (key == ConsoleKey.Q) break;
+                if (key == ConsoleKey.S) ShowStatus(system);
+                if (key == ConsoleKey.T) ShowTopJobs(system);
+                if (key == ConsoleKey.G) await ShowJobDetails(system);
+            }
+
+            Console.WriteLine("\nStopping producers...");
+            cts.Cancel();
+
+            try { await Task.WhenAll(producerTasks); }
+            catch (OperationCanceledException) { }
+
+            Console.WriteLine("Draining remaining jobs...");
+            await Task.Delay(3000);
+
+            await system.ShutdownAsync();
+
+            Console.WriteLine($"\nDone. Submitted: {_submittedJobs}, Rejected: {_rejectedJobs}");
+            Console.ReadKey();
         }
 
         private static async Task ProduceJobsAsync(ProcessingSystem.Services.ProcessingSystem system, int producerId, CancellationToken token)
         {
-            var localRandom = new Random(producerId * 10000 + Environment.TickCount);
+            var rng = new Random(producerId * 10000 + Environment.TickCount);
 
             while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    // Nasumično čekanje između 500ms i 3 sekunde
-                    int delay = localRandom.Next(500, 3000);
-                    await Task.Delay(delay, token);
+                    await Task.Delay(rng.Next(500, 3000), token);
 
-                    // Kreiranje nasumičnog posla
-                    var job = CreateRandomJob(localRandom, producerId);
-
-                    // Prikaz pre submit-a
-                    lock (_consoleLock)
-                    {
-                        Console.WriteLine($"[P{producerId,2}] Submitting Job: {job.Id.ToString().Substring(0, 8)}... | Type: {job.Type,-5} | Priority: {job.Priority,2} | Payload: {TruncatePayload(job.Payload, 30)}");
-                    }
-
-                    // Submit posla
+                    var job = CreateRandomJob(rng, producerId);
                     var handle = system.Submit(job);
+                    string shortId = job.Id.ToString()[..8];
 
                     if (handle.Result == null)
                     {
                         Interlocked.Increment(ref _rejectedJobs);
                         lock (_consoleLock)
-                        {
-                            Console.WriteLine($"[P{producerId,2}] ✗ REJECTED: {job.Id.ToString().Substring(0, 8)}... (Queue full or duplicate)");
-                        }
+                            Console.WriteLine($"[P{producerId}] rejected {shortId} (queue full or duplicate)");
+                        continue;
                     }
-                    else
+
+                    Interlocked.Increment(ref _submittedJobs);
+                    lock (_consoleLock)
+                        Console.WriteLine($"[P{producerId}] submitted {shortId} | {job.Type} | priority {job.Priority} | {TruncatePayload(job.Payload, 30)}");
+
+                    _ = handle.Result.ContinueWith(t =>
                     {
-                        Interlocked.Increment(ref _submittedJobs);
                         lock (_consoleLock)
                         {
-                            Console.WriteLine($"[P{producerId,2}] ✓ ACCEPTED: {job.Id.ToString().Substring(0, 8)}...");
+                            if (t.IsCompletedSuccessfully)
+                                Console.WriteLine($"[P{producerId}] done {shortId} = {t.Result}");
+                            else
+                                Console.WriteLine($"[P{producerId}] failed {shortId}: {t.Exception?.InnerException?.Message}");
                         }
-
-                        // Opciono: pratiti rezultat asinhrono
-                        _ = Task.Run(async () =>
-                        {
-                            try
-                            {
-                                int result = await handle.Result;
-                                lock (_consoleLock)
-                                {
-                                    Console.WriteLine($"[P{producerId,2}] ✔ COMPLETED: {job.Id.ToString().Substring(0, 8)}... = {result}");
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                lock (_consoleLock)
-                                {
-                                    Console.WriteLine($"[P{producerId,2}] ✘ FAILED: {job.Id.ToString().Substring(0, 8)}... ({ex.Message})");
-                                }
-                            }
-                        });
-                    }
+                    });
                 }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
+                catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
                     lock (_consoleLock)
-                    {
-                        Console.WriteLine($"[P{producerId,2}] ERROR: {ex.Message}");
-                    }
+                        Console.WriteLine($"[P{producerId}] error: {ex.Message}");
                 }
             }
 
             lock (_consoleLock)
-            {
-                Console.WriteLine($"[P{producerId,2}] Producer stopped.");
-            }
+                Console.WriteLine($"[P{producerId}] stopped.");
         }
 
-        private static Job CreateRandomJob(Random random, int producerId)
+        private static Job CreateRandomJob(Random rng, int producerId)
         {
-            var jobId = Guid.NewGuid();
+            var type = rng.Next(100) < 60 ? JobType.Prime : JobType.IO;
 
-            var jobType = random.Next(100) < 60 ? JobType.Prime : JobType.IO;
-
-            int priority = random.Next(1, 11);
-
-            string payload;
-            if (jobType == JobType.Prime)
-            {
-                int threads = random.Next(1, 9);
-                int numbers = random.Next(10000, 500001);
-                payload = $"threads:{threads},numbers:{numbers}";
-            }
-            else
-            {
-                int delay = random.Next(100, 2000);
-                payload = $"delay:{delay}";
-            }
+            string payload = type == JobType.Prime
+                ? $"threads:{rng.Next(1, 9)},numbers:{rng.Next(10000, 500001)}"
+                : $"delay:{rng.Next(100, 10000)}";
 
             return new Job
             {
-                Id = jobId,
-                Type = jobType,
+                Id = Guid.NewGuid(),
+                Type = type,
                 Payload = payload,
-                Priority = priority
+                Priority = rng.Next(1, 11)
             };
         }
 
@@ -233,87 +146,67 @@ namespace ProcessingSystem.ConsoleApp
         {
             lock (_consoleLock)
             {
-                Console.WriteLine("\nSystem Status: ");
-                Console.WriteLine($"Total Submitted: {_submittedJobs}");
-                Console.WriteLine($"Total Rejected:  {_rejectedJobs}");
-                Console.WriteLine($"Acceptance Rate: {(_submittedJobs + _rejectedJobs > 0 ? (100.0 * _submittedJobs / (_submittedJobs + _rejectedJobs)).ToString("F1") : "N/A")}%");
+                int total = _submittedJobs + _rejectedJobs;
+                string rate = total > 0 ? $"{100.0 * _submittedJobs / total:F1}%" : "N/A";
 
-                var topJobs = system.GetTopJobs(5);
-                Console.WriteLine($"\nTop {topJobs.Count()} jobs in queue (by priority):");
-                if (topJobs.Any())
-                {
-                    foreach (var job in topJobs)
-                    {
-                        Console.WriteLine($"  [{job.Priority,2}] {job.Id.ToString().Substring(0, 8)}... | {job.Type,-5} | {TruncatePayload(job.Payload, 25)}");
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("  Queue is empty");
-                }
+                Console.WriteLine($"\nsubmitted: {_submittedJobs} | rejected: {_rejectedJobs} | acceptance: {rate}");
+
+                var jobs = system.GetTopJobs(5).ToList();
+                Console.WriteLine(jobs.Count == 0
+                    ? "queue is empty"
+                    : $"top {jobs.Count} in queue:");
+
+                foreach (var job in jobs)
+                    Console.WriteLine($"  {job.Id.ToString()[..8]} | {job.Type} | priority {job.Priority} | {TruncatePayload(job.Payload, 25)}");
+
                 Console.WriteLine();
             }
         }
 
         private static void ShowTopJobs(ProcessingSystem.Services.ProcessingSystem system)
         {
-            Console.Write("\nEnter number of top jobs to display: ");
-            if (!int.TryParse(Console.ReadLine(), out int n) || n <= 0)
+            Console.Write("\nhow many jobs to show? ");
+            string input = Console.ReadLine();  // read first, outside the lock
+
+            if (!int.TryParse(input, out int n) || n <= 0)
             {
-                Console.WriteLine("Invalid number.\n");
+                Console.WriteLine("invalid number.");
                 return;
             }
 
-            lock (_consoleLock)
+            lock (_consoleLock)  // only lock when actually writing results
             {
-                var topJobs = system.GetTopJobs(n);
-                Console.WriteLine($"\nTop {n} jobs in queue (ordered by priority - lower number = higher priority):");
-                Console.WriteLine(new string('-', 80));
+                var jobs = system.GetTopJobs(n).ToList();
+                Console.WriteLine(jobs.Count == 0 ? "\nqueue is empty." : $"\ntop {jobs.Count} jobs:");
 
-                if (topJobs.Any())
-                {
-                    int rank = 1;
-                    foreach (var job in topJobs)
-                    {
-                        Console.WriteLine($"{rank,2}. Priority: {job.Priority,2} | ID: {job.Id} | Type: {job.Type,-5} | Payload: {job.Payload}");
-                        rank++;
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("No jobs in queue.");
-                }
+                for (int i = 0; i < jobs.Count; i++)
+                    Console.WriteLine($"  {i + 1}. [{jobs[i].Priority,2}] {jobs[i].Id} | {jobs[i].Type} | {jobs[i].Payload}");
+
                 Console.WriteLine();
             }
         }
 
         private static async Task ShowJobDetails(ProcessingSystem.Services.ProcessingSystem system)
         {
-            Console.Write("\nEnter Job ID (GUID): ");
+            Console.Write("\njob id: ");
             string input = Console.ReadLine();
+
             lock (_consoleLock)
             {
-                if (Guid.TryParse(input, out Guid id))
+                if (!Guid.TryParse(input, out Guid id))
                 {
-                    var job = system.GetJob(id);
-                    if (job != null)
-                    {
-                        Console.WriteLine("\nJob Details: ");
-                        Console.WriteLine($"ID:       {job.Id}");
-                        Console.WriteLine($"Type:     {job.Type}");
-                        Console.WriteLine($"Priority: {job.Priority}");
-                        Console.WriteLine($"Payload:  {job.Payload}");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"\nJob with ID '{input}' not found.");
-                    }
+                    Console.WriteLine($"'{input}' is not a valid GUID.");
+                    return;
                 }
-                else
+
+                var job = system.GetJob(id);
+                if (job == null)
                 {
-                    Console.WriteLine($"\nInvalid GUID format: '{input}'");
+                    Console.WriteLine($"no job found with id '{input}'.");
+                    return;
                 }
-                Console.WriteLine();
+
+                Console.WriteLine($"\n{job.Id} | {job.Type} | priority {job.Priority} | {job.Payload}\n");
             }
         }
     }

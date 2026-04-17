@@ -11,32 +11,39 @@ namespace ProcessingSystem.Services
 {
     public class ProcessingSystem
     {
-        private readonly SystemConfig _config;
+        private readonly SystemConfig _config; // system configuration
         private List<Task> _workers = new List<Task>();
-        private PriorityQueue<Job, int> _jobQueue = new PriorityQueue<Job, int>();
-        private SemaphoreSlim _signal = new SemaphoreSlim(0);
-        private bool _isComplete = false;
-        private HashSet<Guid> _processedJobs = new HashSet<Guid>();
-        private Dictionary<Guid, TaskCompletionSource<int>> _jobRegistry = new Dictionary<Guid, TaskCompletionSource<int>>();
+
+        // queued jobs based on priority - lower number => higher priority
+        // these jobs are waiting to be picked up from the worker
+        private PriorityQueue<Job, int> _jobQueue = new PriorityQueue<Job, int>(); 
+        private SemaphoreSlim _signal = new SemaphoreSlim(0); // wakes exactly one worker
+        private bool _isComplete = false; // prevents new jobs from being processed after shutdown
+        private HashSet<Guid> _processedJobs = new HashSet<Guid>(); // tracks processed jobs so each job is processed only once
+
+        // maps jobs to its awaiting result
+        private Dictionary<Guid, TaskCompletionSource<int>> _jobRegistry = new Dictionary<Guid, TaskCompletionSource<int>>(); 
         private readonly object _registryLock = new object();
         private static readonly Random _random = new Random();
 
+        // job completed and job failed events
         public event Func<Guid, int, Task>? JobCompleted;
         public event Func<Guid, Task>? JobFailed;
 
-        private static readonly SemaphoreSlim _logLock = new SemaphoreSlim(1, 1);
+        private static readonly SemaphoreSlim _logLock = new SemaphoreSlim(1, 1); // ensures log writes are not overwritten
 
         private Dictionary<Guid, Job> _allJobs = new Dictionary<Guid, Job>();
         private List<JobRecord> _completedRecords = new List<JobRecord>();
         private List<JobRecord> _failedRecords = new List<JobRecord>();
         private readonly object _recordsLock = new object();
-        private int _reportIndex = 0;
-        private Timer _reportTimer;
+        private int _reportIndex = 0; // tracks how many reports was generated
+        private Timer _reportTimer; // timer for report - generate a report every minute
 
         public ProcessingSystem(SystemConfig config)
         {
             _config = config;
 
+            // subscribe to events
             JobCompleted += async (id, result) =>
             {
                 await LogAsync($"[{DateTime.Now}] [COMPLETED] {id}, {result}");
@@ -47,14 +54,17 @@ namespace ProcessingSystem.Services
                 await LogAsync($"[{DateTime.Now}] [FAILED] {id}");
             };
 
+            // initialize worker threads based on configuration
             for (int i = 0; i < _config.WorkerCount; i++)
             {
                 _workers.Add(Task.Run(async () =>
                 {
                     while (true)
                     {
+                        // thread waits here until it can be processed
                         await _signal.WaitAsync();
                         Job? job = null;
+                        // job is removed from queue
                         lock (_jobQueue)
                         {
                             if (_isComplete && _jobQueue.Count == 0) break;
@@ -64,9 +74,12 @@ namespace ProcessingSystem.Services
                         {
                             try
                             {
+                                // waits for the result
+                                // this method handles job process - try 3 times, if failed, return -1
                                 int result = await ProcessJobWithRetry(job);
                                 if (result != -1)
                                 {
+                                    // if the jobs was successful, get its result
                                     lock (_registryLock)
                                     {
                                         if (_jobRegistry.TryGetValue(job.Id, out var tcs))
@@ -79,6 +92,7 @@ namespace ProcessingSystem.Services
                             }
                             catch (Exception ex) 
                             {
+                                // waits for the error to be written into log file
                                 await LogAsync($"[{DateTime.Now}] [ERROR] Job {job.Id} crashed: {ex.Message}");
 
                                 lock (_registryLock)
@@ -95,10 +109,13 @@ namespace ProcessingSystem.Services
                 }));
             }
 
+            // submits jobs from configuration
             if (_config.Jobs != null)
             {
                 foreach (var job in _config.Jobs) Submit(job);
             }
+
+            // starts report timer
             _reportTimer = new Timer(async _ => await GenerateReport(), null,
                 TimeSpan.FromMinutes(1),
                 TimeSpan.FromMinutes(1));
@@ -106,23 +123,31 @@ namespace ProcessingSystem.Services
 
         public JobHandle Submit(Job job)
         {
+            // checks if the submited job is null
             if (job == null) throw new ArgumentNullException(nameof(job));
 
+            // assignes an id to the job if necessary
             if (job.Id == Guid.Empty)
             {
                 job.Id = Guid.NewGuid();
             }
 
+            // waits for the jobs to finish to store the result
             var tcs = new TaskCompletionSource<int>();
             lock (_jobQueue)
             {
+                // checks if the system work is complete
                 if (_isComplete)
                     return new JobHandle { Id = job.Id, Result = null };
+                // checks if the jobs has been processed or is being currently processed
                 if (_processedJobs.Contains(job.Id))
                     return new JobHandle { Id = job.Id, Result = null };
+                // checks if the queue reached max count
                 if (_jobQueue.Count >= _config.MaxQueueSize)
                     return new JobHandle { Id = job.Id, Result = null };
 
+                // if all requierments are met, adds the job to processed jobs and all jobs
+                // enqueue the job so the worker thread can process it
                 _processedJobs.Add(job.Id);
                 _jobQueue.Enqueue(job, job.Priority);
                 _allJobs[job.Id] = job;
@@ -131,7 +156,7 @@ namespace ProcessingSystem.Services
             {
                 _jobRegistry[job.Id] = tcs;
             }
-
+            // wake one threads thats waiting
             _signal.Release();
             return new JobHandle { Id = job.Id, Result = tcs.Task };
         }
@@ -149,6 +174,7 @@ namespace ProcessingSystem.Services
 
         private int ProcessJob(Job job)
         {
+            // process a job based on type
             var payload = ParsePayload(job.Payload);
             if (job.Type == JobType.Prime) 
                 return ProcessPrimeJob(payload);
@@ -159,6 +185,8 @@ namespace ProcessingSystem.Services
 
         private async Task<int> ProcessJobWithRetry(Job job)
         {
+            // each job is processed 2 more times after the first fail (3 attempts total)
+            // job is failed if it takes more than 2 seconds 
             int attempts = 0;
             const int MAX_ATTEMPTS = 3;
             while (attempts < MAX_ATTEMPTS)
@@ -173,6 +201,7 @@ namespace ProcessingSystem.Services
                     stopwatch.Stop();
                     lock (_recordsLock)
                     {
+                        // if the job is finished under 2 second, its added to completed jobs
                         _completedRecords.Add(new JobRecord
                         {
                             JobId = job.Id,
@@ -180,15 +209,18 @@ namespace ProcessingSystem.Services
                             ExecutionTimeSeconds = stopwatch.Elapsed.TotalSeconds
                         });
                     }
+                    // fire event
                     if (JobCompleted != null)
                         await JobCompleted(job.Id, result);
                     return result;
                 } 
                 catch (TimeoutException) 
                 {
+                    // catch timeout exception - job took more than 2 seconds
                     stopwatch.Stop();
                     lock (_recordsLock)
                     {
+                        // add job to failed jobs
                         _failedRecords.Add(new JobRecord
                         {
                             JobId = job.Id,
@@ -196,11 +228,14 @@ namespace ProcessingSystem.Services
                             ExecutionTimeSeconds = stopwatch.Elapsed.TotalSeconds
                         });
                     }
+                    // fire event
                     if (JobFailed != null)
                         await JobFailed(job.Id);
 
+                    // if no more attempts possible
                     if (attempts >= MAX_ATTEMPTS)
                     {
+                        // log aborted job 
                         await LogAsync($"[{DateTime.Now}] [ABORT] {job.Id}");
                         lock (_registryLock)
                         {
@@ -267,6 +302,7 @@ namespace ProcessingSystem.Services
 
         private async Task LogAsync(string message)
         {
+            // logs job result in log file
             await _logLock.WaitAsync();
             try
             {
@@ -278,6 +314,7 @@ namespace ProcessingSystem.Services
             }
         }
 
+        // method returns jobs from queue based on their priority
         public IEnumerable<Job> GetTopJobs(int n)
         {
             lock (_jobQueue)
@@ -290,6 +327,7 @@ namespace ProcessingSystem.Services
             }
         }
 
+        // find job by id
         public Job? GetJob(Guid id)
         {
             lock (_jobQueue)
@@ -299,6 +337,7 @@ namespace ProcessingSystem.Services
             }
         }
 
+        // report generator
         private async Task GenerateReport()
         {
             List<JobRecord> completed;
